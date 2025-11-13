@@ -1,0 +1,354 @@
+import os
+import json
+import logging
+from datetime import datetime, timedelta
+import asyncio
+import aiohttp
+from typing import Dict, List, Optional, Tuple
+import base64
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configuration from environment variables
+CRL_URLS = os.getenv('CRL_URLS', '').split(',')
+KV_NAMESPACE_ID = os.getenv('KV_NAMESPACE_ID')
+CLOUDFLARE_ACCOUNT_ID = os.getenv('CLOUDFLARE_ACCOUNT_ID')
+API_TOKEN = os.getenv('WS_CLOUDFLARE_API_TOKEN')
+MAX_CRL_AGE_HOURS = int(os.getenv('MAX_CRL_AGE_HOURS', '24'))
+RETENTION_DAYS = int(os.getenv('RETENTION_DAYS', '7'))
+ENABLE_HEALTH_CHECK = os.getenv('ENABLE_HEALTH_CHECK', 'true').lower() == 'true'
+ENABLE_CLEANUP = os.getenv('ENABLE_CLEANUP', 'false').lower() == 'true'
+
+# CRL sources configuration
+CRL_SOURCES = [
+    {
+        'name': 'DigiCert Global G2 TLS RSA SHA256 2020 CA1',
+        'url': 'http://crl3.digicert.com/DigiCertGlobalG2TLSRSASHA2562020CA1-1.crl',
+        'enabled': True
+    },
+    {
+        'name': 'NZ Govt CA',
+        'url': 'http://crl.pki.govt.nz/crl/NZGovtCA332.crl',
+        'enabled': True
+    }
+]
+
+# Parse additional CRL URLs from environment
+if CRL_URLS and CRL_URLS[0]:
+    for url in CRL_URLS:
+        url = url.strip()
+        if url:
+            CRL_SOURCES.append({
+                'name': f'Custom CRL - {url.split("/")[-1]}',
+                'url': url,
+                'enabled': True
+            })
+
+def get_crl_key(crl_url: str) -> str:
+    """Generate KV key for a CRL"""
+    return f"CRL_{base64.b64encode(crl_url.encode()).decode()}"
+
+def get_crl_metadata_key(crl_url: str) -> str:
+    """Generate KV key for CRL metadata"""
+    return f"CRL_{base64.b64encode(crl_url.encode()).decode()}"
+
+async def kv_get(key: str) -> Optional[str]:
+    """Get value from Cloudflare KV"""
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/{KV_NAMESPACE_ID}/values/{key}"
+    headers = {'Authorization': f'Bearer {API_TOKEN}'}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    return await response.text()
+                elif response.status == 404:
+                    return None
+                else:
+                    logger.error(f"KV GET failed: {response.status}")
+                    return None
+    except Exception as e:
+        logger.error(f"Error getting KV value: {e}")
+        return None
+
+async def kv_put(key: str, value: str, expiration_ttl: Optional[int] = None) -> bool:
+    """Put value into Cloudflare KV"""
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/{KV_NAMESPACE_ID}/values/{key}"
+    headers = {'Authorization': f'Bearer {API_TOKEN}', 'Content-Type': 'text/plain'}
+    
+    if expiration_ttl:
+        url += f"?expiration_ttl={expiration_ttl}"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(url, headers=headers, data=value) as response:
+                return response.status in [200, 201]
+    except Exception as e:
+        logger.error(f"Error putting KV value: {e}")
+        return False
+
+async def kv_delete(key: str) -> bool:
+    """Delete value from Cloudflare KV"""
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/{KV_NAMESPACE_ID}/values/{key}"
+    headers = {'Authorization': f'Bearer {API_TOKEN}'}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(url, headers=headers) as response:
+                return response.status == 200
+    except Exception as e:
+        logger.error(f"Error deleting KV value: {e}")
+        return False
+
+async def kv_list(prefix: str = None) -> List[Dict]:
+    """List keys in Cloudflare KV"""
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/{KV_NAMESPACE_ID}/keys"
+    if prefix:
+        url += f"?prefix={prefix}"
+    
+    headers = {'Authorization': f'Bearer {API_TOKEN}'}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return result.get('result', [])
+                return []
+    except Exception as e:
+        logger.error(f"Error listing KV keys: {e}")
+        return []
+
+def parse_crl(crl_data: bytes) -> Tuple[Optional[datetime], Optional[datetime], Dict[str, bool]]:
+    """
+    Parse CRL using cryptography library
+    
+    Returns:
+        Tuple of (next_update, this_update, revoked_serials_dict)
+        revoked_serials_dict: {"SERIAL_HEX": true, ...}
+    """
+    try:
+        # Parse CRL using cryptography library
+        crl = x509.load_der_x509_crl(crl_data, default_backend())
+        
+        # Extract dates
+        this_update = crl.last_update
+        next_update = crl.next_update
+        
+        # Get all revoked certificates and build dict
+        revoked_certs = list(crl)
+        revoked_serials_dict = {
+            format(cert.serial_number, 'X'): True
+            for cert in revoked_certs
+        }
+        
+        revoked_count = len(revoked_serials_dict)
+        logger.info(f"CRL parsed successfully: {revoked_count} revoked certificates")
+        
+        # Log sample for debugging
+        sample_serials = list(revoked_serials_dict.keys())[:3]
+        if sample_serials:
+            logger.info(f"Sample revoked serials: {', '.join(sample_serials)}...")
+        
+        return next_update, this_update, revoked_serials_dict
+        
+    except Exception as e:
+        logger.error(f"Failed to parse CRL: {e}")
+        return None, None, {}
+
+async def fetch_and_parse_crl(crl_source: Dict) -> Dict:
+    """Fetch and parse a CRL from the given source"""
+    logger.info(f"[FETCH] Fetching CRL: {crl_source['name']}")
+    start_time = datetime.now()
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(crl_source['url'], timeout=aiohttp.ClientTimeout(total=60)) as response:
+                if response.status != 200:
+                    raise Exception(f"HTTP {response.status}")
+                
+                crl_data = await response.read()
+                fetch_duration = (datetime.now() - start_time).total_seconds()
+                logger.info(f"[FETCH] Downloaded {len(crl_data)} bytes in {fetch_duration:.2f}s")
+                
+                next_update, this_update, revoked_serials_dict = parse_crl(crl_data)
+                
+                return {
+                    'success': True,
+                    'fetched_at': datetime.now().isoformat(),
+                    'bytes': len(crl_data),
+                    'fetch_duration_ms': int(fetch_duration * 1000),
+                    'revoked_count': len(revoked_serials_dict),
+                    'next_update': next_update.isoformat() if next_update else None,
+                    'this_update': this_update.isoformat() if this_update else None,
+                    'revoked_serials_dict': revoked_serials_dict
+                }
+    except Exception as e:
+        fetch_duration = (datetime.now() - start_time).total_seconds()
+        logger.error(f"[FETCH] Failed: {e}")
+        return {
+            'success': False,
+            'error': str(e),
+            'fetch_duration_ms': int(fetch_duration * 1000),
+            'fetched_at': datetime.now().isoformat()
+        }
+
+async def update_crl(crl_source: Dict) -> Dict:
+    """Update a single CRL in KV storage"""
+    logger.info(f"[UPDATE] Processing CRL: {crl_source['name']}")
+    result = await fetch_and_parse_crl(crl_source)
+    
+    try:
+        metadata = {
+            'name': crl_source['name'],
+            'url': crl_source['url'],
+            'last_updated': datetime.now().isoformat(),
+            'status': 'success' if result['success'] else 'error',
+            **result
+        }
+        
+        await kv_put(get_crl_metadata_key(crl_source['url']), json.dumps(metadata))
+        logger.info(f"[UPDATE] Stored metadata for {crl_source['name']}")
+        
+        if result['success'] and result.get('revoked_serials_dict') is not None:
+            # Store CRL in the required format
+            crl_payload = {
+                'next_update': result['next_update'],
+                'this_update': result['this_update'],
+                'revokedSerialNumbers': result['revoked_serials_dict']
+            }
+            await kv_put(get_crl_key(crl_source['url']), json.dumps(crl_payload))
+            logger.info(f"[UPDATE] Stored CRL data for {crl_source['name']} ({result['revoked_count']} revoked certs)")
+        
+        return metadata
+    except Exception as e:
+        logger.error(f"[UPDATE] Failed to store: {e}")
+        return {'name': crl_source['name'], 'url': crl_source['url'], 'status': 'error', 'error': str(e)}
+
+async def check_crl_health() -> List[Dict]:
+    """Check health of all CRLs"""
+    logger.info('[HEALTH] Starting CRL health check')
+    results = []
+    now = datetime.now()
+    
+    for crl_source in CRL_SOURCES:
+        if not crl_source['enabled']:
+            continue
+        
+        metadata_str = await kv_get(get_crl_metadata_key(crl_source['url']))
+        if not metadata_str:
+            logger.warning(f"[HEALTH] Missing metadata: {crl_source['name']}")
+            results.append({'name': crl_source['name'], 'url': crl_source['url'], 'status': 'missing', 'health': 'critical'})
+            continue
+        
+        try:
+            metadata = json.loads(metadata_str)
+            last_updated = datetime.fromisoformat(metadata['last_updated'])
+            age_hours = (now - last_updated).total_seconds() / 3600
+            
+            health = 'healthy' if metadata['status'] == 'success' and age_hours <= MAX_CRL_AGE_HOURS else ('stale' if age_hours > MAX_CRL_AGE_HOURS else 'error')
+            logger.info(f"[HEALTH] {crl_source['name']}: {health} (age: {age_hours:.1f} hours)")
+            
+            results.append({
+                'name': crl_source['name'],
+                'url': crl_source['url'],
+                'status': metadata['status'],
+                'health': health,
+                'age_hours': round(age_hours, 1),
+                'last_updated': metadata['last_updated'],
+                'revoked_count': metadata.get('revoked_count')
+            })
+        except Exception as e:
+            logger.error(f"[HEALTH] Error checking {crl_source['name']}: {e}")
+            results.append({'name': crl_source['name'], 'url': crl_source['url'], 'health': 'error', 'error': str(e)})
+    
+    return results
+
+async def cleanup_old_crls() -> Dict:
+    """Clean up old CRL data beyond retention period"""
+    logger.info('[CLEANUP] Starting CRL cleanup')
+    now = datetime.now()
+    retention_threshold = now - timedelta(days=RETENTION_DAYS)
+    cleaned_count = 0
+    
+    keys = await kv_list(prefix='CRL_')
+    
+    for key_info in keys:
+        metadata_str = await kv_get(key_info['name'])
+        if not metadata_str:
+            continue
+        
+        try:
+            metadata = json.loads(metadata_str)
+            last_updated = datetime.fromisoformat(metadata['last_updated'])
+            is_active = any(s['url'] == metadata['url'] and s['enabled'] for s in CRL_SOURCES)
+            
+            if not is_active and last_updated < retention_threshold:
+                age_days = (now - last_updated).days
+                logger.info(f"[CLEANUP] Removing old CRL: {metadata['name']} (age: {age_days} days)")
+                await kv_delete(key_info['name'])
+                await kv_delete(get_crl_key(metadata['url']))
+                cleaned_count += 1
+        except Exception as e:
+            logger.error(f"[CLEANUP] Error processing key: {e}")
+    
+    logger.info(f"[CLEANUP] Cleanup complete: removed {cleaned_count} old CRLs")
+    return {'cleaned_count': cleaned_count}
+
+async def main():
+    """Main function"""
+    logger.info("🚀 Starting CRL Housekeeping Container")
+    logger.info(f"=== CRL HOUSEKEEPING STARTED at {datetime.now().isoformat()} ===")
+    
+    if not all([API_TOKEN, KV_NAMESPACE_ID, CLOUDFLARE_ACCOUNT_ID]):
+        logger.error("❌ Missing required environment variables")
+        return False
+    
+    logger.info(f"📋 Configuration: {len([s for s in CRL_SOURCES if s['enabled']])} CRL sources")
+    
+    results = {'timestamp': datetime.now().isoformat(), 'updates': [], 'health': [], 'cleanup': None}
+    
+    try:
+        logger.info('[STEP 1] Updating CRLs...')
+        for crl_source in CRL_SOURCES:
+            if crl_source['enabled']:
+                results['updates'].append(await update_crl(crl_source))
+        
+        success_count = sum(1 for r in results['updates'] if r.get('status') == 'success')
+        logger.info(f"[STEP 1] Complete: {success_count}/{len(results['updates'])} success")
+        
+        if ENABLE_HEALTH_CHECK:
+            logger.info('[STEP 2] Checking CRL health...')
+            results['health'] = await check_crl_health()
+            unhealthy = sum(1 for h in results['health'] if h.get('health') != 'healthy')
+            logger.info(f"[STEP 2] Complete: {len(results['health']) - unhealthy} healthy, {unhealthy} unhealthy")
+            
+            if unhealthy > 0:
+                logger.warning('[ALERT] Unhealthy CRLs detected')
+        
+        if ENABLE_CLEANUP:
+            logger.info('[STEP 3] Cleaning up old CRLs...')
+            results['cleanup'] = await cleanup_old_crls()
+        
+        logger.info("✅ CRL Housekeeping completed successfully")
+        print("\n" + "="*60)
+        print("📊 CRL HOUSEKEEPING SUMMARY")
+        print("="*60)
+        print(f"Updates: {success_count}/{len(results['updates'])} success")
+        if ENABLE_HEALTH_CHECK:
+            print(f"Health: {len(results['health']) - unhealthy} healthy")
+        if ENABLE_CLEANUP:
+            print(f"Cleanup: {results['cleanup']['cleaned_count']} removed")
+        print("="*60 + "\n")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}")
+        logger.exception(e)
+        return False
+
+if __name__ == "__main__":
+    asyncio.run(main())

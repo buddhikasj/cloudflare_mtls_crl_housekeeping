@@ -1,0 +1,92 @@
+/**
+ * Wrangler Configuration Template - CRL Housekeeping
+ * 
+ * Copy this file to wrangler.jsonc and update the placeholder values.
+ * 
+ * For more details: https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "cron-container-crl-housekeeping",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-06-23",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true
+	},
+
+	/**
+	 * Environment Variables
+	 * Replace placeholder values with your actual configuration
+	 */
+	"vars": {
+		"CLOUDFLARE_ACCOUNT_ID": "YOUR_CLOUDFLARE_ACCOUNT_ID",
+		"KV_NAMESPACE_ID": "YOUR_KV_NAMESPACE_ID",
+		"LARGE_CRL_QUEUE_ID": "YOUR_LARGE_CRL_QUEUE_NAMESPACE_ID",
+		"ENABLE_QUEUE_PROCESSING": "true"
+	},
+
+	/**
+	 * Cron Triggers
+	 * Default: Every 6 hours
+	 * Customize as needed:
+	 *   "0 *6 * * *"   - Every 6 hours
+	 *   "0 *4 * * *"   - Every 4 hours
+	 *   "0 2 * * *"     - Daily at 2 AM
+	 *   "0 0 * * 0"     - Weekly on Sunday at midnight
+	 */
+	"triggers": {
+		"crons": [
+			"0 */6 * * *"
+		]
+	},
+	
+	/**
+	 * Container Configuration
+	 */
+	"containers": [
+		{
+			"class_name": "CRLHousekeepingContainer",
+			"image": "./Dockerfile",
+			"max_instances": 1,
+			"name": "crl-housekeeping-container"
+		}
+	],
+	
+	/**
+	 * Durable Objects Configuration
+	 */
+	"durable_objects": {
+		"bindings": [
+			{
+				"class_name": "CRLHousekeepingContainer",
+				"name": "CRL_HOUSEKEEPING_CONTAINER"
+			}
+		]
+	},
+	
+	/**
+	 * KV Namespace Bindings
+	 *
+	"kv_namespaces": [
+		{
+			"binding": "CRL_NAMESPACE",
+			"id": "YOUR_KV_NAMESPACE_ID"
+		}
+	],
+	*/
+	
+	/**
+	 * Migrations Configuration
+	 */
+	"migrations": [
+		{
+			"new_sqlite_classes": [
+				"CRLHousekeepingContainer"
+			],
+			"tag": "v1"
+		}
+	]
+}

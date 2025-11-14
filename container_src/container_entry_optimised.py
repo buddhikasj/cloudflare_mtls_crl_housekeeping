@@ -97,10 +97,21 @@ async def kv_list(prefix: str = None, namespace_id: str = None) -> List[Dict]:
                 if response.status == 200:
                     result = await response.json()
                     return result.get('result', [])
-                return []
+                else:
+                    error_body = await response.text()
+                    error_msg = f"KV LIST failed: status={response.status}, prefix={prefix}, namespace={ns_id}, response={error_body}"
+                    logger.error(error_msg)
+                    raise Exception(error_msg)
+    except aiohttp.ClientError as e:
+        error_msg = f"Network error listing KV keys: prefix={prefix}, error={str(e)}"
+        logger.error(error_msg)
+        raise Exception(error_msg)
     except Exception as e:
-        logger.error(f"Error listing KV keys: {e}")
-        return []
+        if "KV LIST failed" in str(e):
+            raise
+        error_msg = f"Unexpected error listing KV keys: prefix={prefix}, error={str(e)}"
+        logger.error(error_msg)
+        raise Exception(error_msg)
 
 def parse_crl(crl_data: bytes) -> Tuple[Optional[datetime], Optional[datetime], List[str]]:
     """

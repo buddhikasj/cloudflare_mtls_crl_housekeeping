@@ -32,8 +32,8 @@
 	 * Cron Triggers
 	 * Default: Every 6 hours
 	 * Customize as needed:
-	 *   "0 *6 * * *"   - Every 6 hours
-	 *   "0 *4 * * *"   - Every 4 hours
+	 //*   "0 */6 * * *"   - Every 6 hours
+	 //*   "0 */4 * * *"   - Every 4 hours
 	 *   "0 2 * * *"     - Daily at 2 AM
 	 *   "0 0 * * 0"     - Weekly on Sunday at midnight
 	 */
